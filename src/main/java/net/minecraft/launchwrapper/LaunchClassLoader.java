@@ -85,19 +85,17 @@ public class LaunchClassLoader extends URLClassLoader {
 
     // classloader exclusions
     addClassLoaderExclusion("java.");
+    addClassLoaderExclusion("jdk.");
     addClassLoaderExclusion("sun.");
-    addClassLoaderExclusion("com.sun.");
-    addClassLoaderExclusion("org.lwjgl.");
-    addClassLoaderExclusion("org.apache.logging.");
-    addClassLoaderExclusion("org.fusesource.jansi.");
+    addClassLoaderExclusion("joptsimple.");
+    addClassLoaderExclusion("org.slf4j.");
+    addClassLoaderExclusion("com.sun.jndi.");
     addClassLoaderExclusion("net.minecraft.launchwrapper.");
 
     // transformer exclusions
+    addTransformerExclusion("jdk.");
     addTransformerExclusion("javax.");
-    addTransformerExclusion("argo.");
     addTransformerExclusion("org.objectweb.asm.");
-    addTransformerExclusion("com.google.common.");
-    addTransformerExclusion("org.bouncycastle.");
 
     ClassLoader systemClassLoader = ClassLoader.getSystemClassLoader();
 
