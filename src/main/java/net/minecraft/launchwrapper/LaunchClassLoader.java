@@ -1,497 +1,547 @@
 package net.minecraft.launchwrapper;
 
-import org.apache.logging.log4j.Level;
-import org.apache.logging.log4j.LogManager;
-import org.apache.logging.log4j.Logger;
-
-import java.io.*;
+import java.io.ByteArrayOutputStream;
+import java.io.Closeable;
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.lang.reflect.Constructor;
 import java.net.JarURLConnection;
 import java.net.URL;
 import java.net.URLClassLoader;
 import java.net.URLConnection;
 import java.security.CodeSigner;
 import java.security.CodeSource;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.jar.Attributes;
 import java.util.jar.Attributes.Name;
 import java.util.jar.JarEntry;
 import java.util.jar.JarFile;
 import java.util.jar.Manifest;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 
 /**
  * The class loader to inject transformers in to.
  *
  * @author cpw, Erik Broes, Mumfrey and Nathan Adams
  */
-
 public class LaunchClassLoader extends URLClassLoader {
 
-    private static final Logger LOGGER = LogManager.getLogger("LaunchWrapper");
+  private static final Logger LOGGER = LogManager.getLogger("LaunchWrapper");
+  /** The size of the chunks when fully reading a stream. */
+  private static final int BUFFER_SIZE = 1 << 12;
 
-    /**
-     * The size of the chunks when fully reading a stream.
-     */
-    private static final int BUFFER_SIZE = 1 << 12;
-    private List<URL> sources;
-    private ClassLoader parent = getClass().getClassLoader();
+  private static final String[] RESERVED_NAMES = {
+    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9"
+  };
+  private static final boolean DEBUG =
+      Boolean.parseBoolean(System.getProperty("legacy.debugClassLoading", "false"));
+  private static final boolean DEBUG_FINER =
+      DEBUG && Boolean.parseBoolean(System.getProperty("legacy.debugClassLoadingFiner", "false"));
+  private static final boolean DEBUG_SAVE =
+      DEBUG && Boolean.parseBoolean(System.getProperty("legacy.debugClassLoadingSave", "false"));
+  private static File tempFolder = null;
 
-    private List<IClassTransformer> transformers = new ArrayList<>(2);
-    private Map<String, Class<?>> cachedClasses = new ConcurrentHashMap<>();
-    private Set<String> invalidClasses = new HashSet<>(1000);
+  static {
+    ClassLoader.registerAsParallelCapable();
+  }
 
-    private Set<String> classLoaderExceptions = new HashSet<>();
-    private Set<String> transformerExceptions = new HashSet<>();
-    private Map<String, byte[]> resourceCache = new ConcurrentHashMap<>(1000);
-    private Set<String> negativeResourceCache = Collections.newSetFromMap(new ConcurrentHashMap<>());
+  private final ThreadLocal<byte[]> loadBuffer =
+      ThreadLocal.withInitial(() -> new byte[BUFFER_SIZE]);
+  private final List<URL> sources;
+  private final ClassLoader parent = getClass().getClassLoader();
+  private final List<IClassTransformer> transformers = new ArrayList<>(2);
+  private final Map<String, Class<?>> cachedClasses = new ConcurrentHashMap<>();
+  private final Set<String> invalidClasses = new HashSet<>(1000);
+  private final Set<String> classLoaderExceptions = new HashSet<>();
+  private final Set<String> transformerExceptions = new HashSet<>();
+  private final Map<String, byte[]> resourceCache = new ConcurrentHashMap<>(1000);
+  private final Set<String> negativeResourceCache =
+      Collections.newSetFromMap(new ConcurrentHashMap<>());
+  private IClassNameTransformer renameTransformer;
 
-    private IClassNameTransformer renameTransformer;
+  /**
+   * Creates a new {@link LaunchClassLoader}
+   *
+   * @param sources The URLs to load from.
+   */
+  @SuppressWarnings("ResultOfMethodCallIgnored")
+  public LaunchClassLoader(URL[] sources) {
+    super(sources, null);
+    this.sources = new ArrayList<>(Arrays.asList(sources));
 
-    private final ThreadLocal<byte[]> loadBuffer = new ThreadLocal<>();
+    // classloader exclusions
+    addClassLoaderExclusion("java.");
+    addClassLoaderExclusion("sun.");
+    addClassLoaderExclusion("com.sun.");
+    addClassLoaderExclusion("org.lwjgl.");
+    addClassLoaderExclusion("org.apache.logging.");
+    addClassLoaderExclusion("org.fusesource.jansi.");
+    addClassLoaderExclusion("net.minecraft.launchwrapper.");
 
-    private static final String[] RESERVED_NAMES = {"CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5",
-            "COM6", "COM7", "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9"};
+    // transformer exclusions
+    addTransformerExclusion("javax.");
+    addTransformerExclusion("argo.");
+    addTransformerExclusion("org.objectweb.asm.");
+    addTransformerExclusion("com.google.common.");
+    addTransformerExclusion("org.bouncycastle.");
 
-    private static final boolean DEBUG = Boolean.parseBoolean(
-            System.getProperty("legacy.debugClassLoading", "false"));
-    private static final boolean DEBUG_FINER = DEBUG && Boolean.parseBoolean(
-            System.getProperty("legacy.debugClassLoadingFiner", "false"));
-    private static final boolean DEBUG_SAVE = DEBUG && Boolean.parseBoolean(
-            System.getProperty("legacy.debugClassLoadingSave", "false"));
-    private static File tempFolder = null;
+    ClassLoader systemClassLoader = ClassLoader.getSystemClassLoader();
 
-    /**
-     * Creates a new {@link LaunchClassLoader}
-     *
-     * @param sources The URLs to load from.
-     */
+    // By default LaunchWrapper inherits the class path from the system class loader.
+    // However, JRE extensions (e.g Nashorn in the jre/lib/ext directory) are not part of the class
+    // path of the system class loader.
+    //
+    // Instead, they're loaded using a parent class loader. Currently, LaunchWrapper does not fall
+    // back to the parent class loader if it's unable to find a class on its class path. To make
+    // the JRE extensions usable for plugins we manually add the URL's from the ExtClassLoader to
+    // LaunchWrapper's class path.
+    if (systemClassLoader != null) {
+      systemClassLoader = systemClassLoader.getParent();
 
-    public LaunchClassLoader(URL[] sources) {
-        super(sources, null);
-        this.sources = new ArrayList<>(Arrays.asList(sources));
+      if (systemClassLoader instanceof URLClassLoader) {
+        Arrays.stream(((URLClassLoader) systemClassLoader).getURLs()).forEach(this::addURL);
+      }
+    }
 
-        // classloader exclusions
-        addClassLoaderExclusion("java.");
-        addClassLoaderExclusion("sun.");
-        addClassLoaderExclusion("com.sun.");
-        addClassLoaderExclusion("org.lwjgl.");
-        addClassLoaderExclusion("org.apache.logging.");
-        addClassLoaderExclusion("org.fusesource.jansi.");
-        addClassLoaderExclusion("net.minecraft.launchwrapper.");
+    if (DEBUG_SAVE) {
+      int x = 1;
+      tempFolder = new File(Launch.minecraftHome, "CLASSLOADER_TEMP");
+      while (tempFolder.exists() && x <= 10) {
+        tempFolder = new File(Launch.minecraftHome, "CLASSLOADER_TEMP" + x++);
+      }
 
-        // transformer exclusions
-        addTransformerExclusion("javax.");
-        addTransformerExclusion("argo.");
-        addTransformerExclusion("org.objectweb.asm.");
-        addTransformerExclusion("com.google.common.");
-        addTransformerExclusion("org.bouncycastle.");
+      if (tempFolder.exists()) {
+        LOGGER.info(
+            "DEBUG_SAVE enabled, but 10 temp directories already exist,"
+                + " clean them and try again.");
+        tempFolder = null;
+      } else {
+        LOGGER.info(
+            "DEBUG_SAVE Enabled, saving all classes to \"{}\"",
+            tempFolder.getAbsolutePath().replace('\\', '/'));
+        tempFolder.mkdirs();
+      }
+    }
+  }
 
-        if (DEBUG_SAVE) {
-            int x = 1;
-            tempFolder = new File(Launch.minecraftHome, "CLASSLOADER_TEMP");
-            while (tempFolder.exists() && x <= 10) {
-                tempFolder = new File(Launch.minecraftHome, "CLASSLOADER_TEMP" + x++);
-            }
+  private static void closeSilently(Closeable closeable) {
+    if (closeable != null) {
+      try {
+        closeable.close();
+      } catch (IOException ignored) {
+      }
+    }
+  }
 
-            if (tempFolder.exists()) {
-                LOGGER.info("DEBUG_SAVE enabled, but 10 temp directories already exist," +
-                        " clean them and try again.");
-                tempFolder = null;
+  /**
+   * Registers a transformer. The transformer will be loaded with this class loader, not the parent
+   * one.
+   *
+   * @param transformerClassName The transformer to inject
+   */
+  public void registerTransformer(String transformerClassName) {
+    try {
+      Class<?> transformerClass = loadClass(transformerClassName);
+
+      Set<Constructor<?>> otherConstructors = new HashSet<>();
+      Constructor<?> emptyConstructor = null;
+
+      for (final Constructor<?> declaredConstructor : transformerClass.getDeclaredConstructors()) {
+        if (declaredConstructor.getParameterCount() == 0) {
+          emptyConstructor = declaredConstructor;
+          break;
+        }
+        otherConstructors.add(declaredConstructor);
+      }
+
+      if (emptyConstructor == null) {
+        LOGGER.error(
+            "Could not register the Transformer because it did not have an empty constructor!");
+        LOGGER.error("Found constructors:");
+        otherConstructors.stream()
+            .map(otherConstructor -> "\tParameter Count: " + otherConstructor.getParameterCount())
+            .forEach(LOGGER::error);
+        otherConstructors.clear();
+        return;
+      }
+
+      IClassTransformer transformer = (IClassTransformer) emptyConstructor.newInstance();
+      this.transformers.add(transformer);
+      if (transformer instanceof IClassNameTransformer && this.renameTransformer == null) {
+        this.renameTransformer = (IClassNameTransformer) transformer;
+      }
+    } catch (Exception exception) {
+      LOGGER.error(
+          "A critical problem occurred registering the ASM transformer class {}",
+          transformerClassName,
+          exception);
+    }
+  }
+
+  /**
+   * Loads in a class. It is recommended to use {@link ClassLoader#loadClass(String)} instead.
+   *
+   * @param name The name of the class to load
+   */
+  @Override
+  public Class<?> findClass(final String name) throws ClassNotFoundException {
+    if (this.invalidClasses.contains(name)) {
+      throw new ClassNotFoundException(name);
+    }
+
+    for (final String exception : this.classLoaderExceptions) {
+      if (name.startsWith(exception)) return parent.loadClass(name);
+    }
+
+    if (this.cachedClasses.containsKey(name)) return this.cachedClasses.get(name);
+
+    for (final String exception : this.transformerExceptions) {
+      if (name.startsWith(exception)) {
+        try {
+          final Class<?> clazz = super.findClass(name);
+          this.cachedClasses.put(name, clazz);
+          return clazz;
+        } catch (ClassNotFoundException e) {
+          this.invalidClasses.add(name);
+          throw e;
+        }
+      }
+    }
+
+    final String transformedName = transformName(name);
+    if (this.cachedClasses.containsKey(transformedName)) {
+      return this.cachedClasses.get(transformedName);
+    }
+
+    final String untransformedName = untransformName(name);
+
+    // Get class bytes
+    byte[] classData = getClassBytes(untransformedName);
+
+    byte[] transformedClass;
+    try {
+      // Run transformers (running with null class bytes is valid, because transformers may generate
+      // classes dynamically)
+      transformedClass = runTransformers(untransformedName, transformedName, classData);
+    } catch (Exception exception) {
+      LOGGER.trace("Exception encountered while transformimg class {}", name, exception);
+      throw exception;
+    }
+
+    // If transformer chain provides no class data, mark given class name invalid and throw CNFE
+    if (transformedClass == null) {
+      invalidClasses.add(name);
+      throw new ClassNotFoundException(name);
+    }
+
+    // Save class if requested so
+    if (DEBUG_SAVE) {
+      saveTransformedClass(transformedClass, transformedName);
+    }
+
+    // Define package for class
+    int lastDot = untransformedName.lastIndexOf('.');
+    String packageName = lastDot == -1 ? "" : untransformedName.substring(0, lastDot);
+    String fileName = untransformedName.replace('.', '/').concat(".class");
+    URLConnection urlConnection = findCodeSourceConnectionFor(fileName);
+    CodeSigner[] signers = null;
+
+    try {
+      if (lastDot > -1
+          && (!untransformedName.startsWith("net.minecraft.")
+              && !untransformedName.startsWith("com.mojang."))) {
+        if (urlConnection instanceof final JarURLConnection jarURLConnection) {
+          final JarFile jarFile = jarURLConnection.getJarFile();
+
+          if (jarFile != null && jarFile.getManifest() != null) {
+            final Manifest manifest = jarFile.getManifest();
+            final JarEntry entry = jarFile.getJarEntry(fileName);
+
+            Package pkg = getPackage(packageName);
+            getClassBytes(untransformedName);
+            signers = entry.getCodeSigners();
+            if (pkg == null) {
+              pkg = definePackage(packageName, manifest, jarURLConnection.getJarFileURL());
             } else {
-                LOGGER.info("DEBUG_SAVE Enabled, saving all classes to \"%s\"",
-                        tempFolder.getAbsolutePath().replace('\\', '/'));
-                tempFolder.mkdirs();
+              if (pkg.isSealed() && !pkg.isSealed(jarURLConnection.getJarFileURL())) {
+                LOGGER.error(
+                    "The jar file {} is trying to seal already secured path {}",
+                    jarFile.getName(),
+                    packageName);
+              } else if (isSealed(packageName, manifest)) {
+                LOGGER.error(
+                    "The jar file {} has a security seal for path {}, but that path is defined and not secure",
+                    jarFile.getName(),
+                    packageName);
+              }
             }
-        }
-    }
-
-    /**
-     * Registers a transformer. The transformer will be loaded with this class loader, not the parent one.
-     *
-     * @param transformerClassName The transformer to inject
-     */
-
-    public void registerTransformer(String transformerClassName) {
-        try {
-            IClassTransformer transformer = (IClassTransformer) loadClass(transformerClassName).newInstance();
-            transformers.add(transformer);
-            if (transformer instanceof IClassNameTransformer && renameTransformer == null) {
-                renameTransformer = (IClassNameTransformer) transformer;
-            }
-        } catch (Exception e) {
-            LOGGER.error("A critical problem occurred registering the ASM transformer class {}", transformerClassName, e);
-        }
-    }
-
-    /**
-     * Loads in a class. It is recommended to use {@link ClassLoader#loadClass(String)} instead.
-     *
-     * @param name The name of the class to load
-     */
-
-    @Override
-    public Class<?> findClass(final String name) throws ClassNotFoundException {
-        if (invalidClasses.contains(name)) {
-            throw new ClassNotFoundException(name);
-        }
-
-        for (final String exception : classLoaderExceptions) {
-            if (name.startsWith(exception)) {
-                return parent.loadClass(name);
-            }
-        }
-
-        if (cachedClasses.containsKey(name)) {
-            return cachedClasses.get(name);
-        }
-
-        for (final String exception : transformerExceptions) {
-            if (name.startsWith(exception)) {
-                try {
-                    final Class<?> clazz = super.findClass(name);
-                    cachedClasses.put(name, clazz);
-                    return clazz;
-                } catch (ClassNotFoundException e) {
-                    invalidClasses.add(name);
-                    throw e;
-                }
-            }
-        }
-
-        try {
-            final String transformedName = transformName(name);
-            if (cachedClasses.containsKey(transformedName)) {
-                return cachedClasses.get(transformedName);
-            }
-
-            final String untransformedName = untransformName(name);
-
-            final int lastDot = untransformedName.lastIndexOf('.');
-            final String packageName = lastDot == -1 ? "" : untransformedName.substring(0, lastDot);
-            final String fileName = untransformedName.replace('.', '/').concat(".class");
-            URLConnection urlConnection = findCodeSourceConnectionFor(fileName);
-
-            if (urlConnection == null) throw new ClassNotFoundException(name);
-
-            CodeSigner[] signers = null;
-
-            if (lastDot > -1 && !untransformedName.startsWith("net.minecraft.") &&
-                    !untransformedName.startsWith("com.mojang.blaze3d.")) {
-                if (urlConnection instanceof JarURLConnection) {
-                    final JarURLConnection jarURLConnection = (JarURLConnection) urlConnection;
-                    final JarFile jarFile = jarURLConnection.getJarFile();
-
-                    if (jarFile != null && jarFile.getManifest() != null) {
-                        final Manifest manifest = jarFile.getManifest();
-                        final JarEntry entry = jarFile.getJarEntry(fileName);
-
-                        Package pkg = getPackage(packageName);
-                        getClassBytes(untransformedName);
-                        signers = entry.getCodeSigners();
-                        if (pkg != null) {
-                            if (pkg.isSealed() && !pkg.isSealed(jarURLConnection.getJarFileURL())) {
-                                LOGGER.info("The jar file {} is trying to seal already secured path {}",
-                                        jarFile.getName(), packageName);
-                            } else if (isSealed(packageName, manifest)) {
-                                LOGGER.warn("The jar file {} has a security seal for path {}," +
-                                        " but that path is defined and not secure", jarFile.getName(), packageName);
-                            }
-                        } else {
-                            definePackage(packageName, manifest, jarURLConnection.getJarFileURL());
-                        }
-                    }
-                } else {
-                    Package pkg = getPackage(packageName);
-                    if (pkg != null) {
-                        if (pkg.isSealed()) {
-                            LOGGER.info("The URL {} is defining elements for sealed path {}",
-                                    urlConnection.getURL(), packageName);
-                        }
-                    } else {
-                        definePackage(packageName, null, null, null, null, null, null, null);
-                    }
-                }
-            }
-
-            final byte[] transformedClass = runTransformers(untransformedName, transformedName, getClassBytes(untransformedName));
-
-            if (transformedClass != null) {
-
-                if (DEBUG_SAVE) {
-                    saveTransformedClass(transformedClass, transformedName);
-                }
-
-                final CodeSource codeSource = new CodeSource(urlConnection.getURL(), signers);
-                final Class<?> clazz = defineClass(transformedName, transformedClass, 0,
-                        transformedClass.length, codeSource);
-                cachedClasses.put(transformedName, clazz);
-                return clazz;
-            } else {
-                throw new ClassNotFoundException(name);
-            }
-
-        } catch (Throwable e) {
-            invalidClasses.add(name);
-            if (DEBUG) {
-                LOGGER.trace("Exception encountered attempting classloading of {}", name, e);
-                LogManager.getLogger("LaunchWrapper").log(Level.ERROR, "Exception encountered" +
-                        " attempting classloading of {}", name, e);
-            }
-
-            if (e instanceof ClassNotFoundException) throw (ClassNotFoundException) e;
-
-            throw new ClassNotFoundException(name, e);
-        }
-    }
-
-    private void saveTransformedClass(final byte[] data, final String transformedName) {
-        if (tempFolder == null || data == null) {
-            return;
-        }
-
-        final File outFile = new File(tempFolder, transformedName
-                .replace('.', File.separatorChar) + ".class");
-        final File outDir = outFile.getParentFile();
-
-        if (!outDir.exists()) {
-            outDir.mkdirs();
-        }
-
-        if (outFile.exists()) {
-            outFile.delete();
-        }
-
-        try {
-            LOGGER.debug("Saving transformed class \"{}\" to \"{}\"", transformedName,
-                    outFile.getAbsolutePath().replace('\\', '/'));
-
-            final OutputStream output = new FileOutputStream(outFile);
-            output.write(data);
-            output.close();
-        } catch (IOException ex) {
-            LOGGER.warn("Could not save transformed class \"{}\"", transformedName, ex);
-        }
-    }
-
-    private String untransformName(final String name) {
-        if (renameTransformer != null) {
-            return renameTransformer.unmapClassName(name);
-        }
-
-        return name;
-    }
-
-    private String transformName(final String name) {
-        if (renameTransformer != null) {
-            return renameTransformer.remapClassName(name);
-        }
-
-        return name;
-    }
-
-    private boolean isSealed(final String path, final Manifest manifest) {
-        Attributes attributes = manifest.getAttributes(path);
-        String sealed = null;
-        if (attributes != null) {
-            sealed = attributes.getValue(Name.SEALED);
-        }
-
-        if (sealed == null) {
-            attributes = manifest.getMainAttributes();
-            if (attributes != null) {
-                sealed = attributes.getValue(Name.SEALED);
-            }
-        }
-        return "true".equalsIgnoreCase(sealed);
-    }
-
-    private URLConnection findCodeSourceConnectionFor(final String name) {
-        final URL resource = findResource(name);
-        if (resource != null) {
-            try {
-                return resource.openConnection();
-            } catch (IOException e) {
-                throw new RuntimeException(e);
-            }
-        }
-
-        return null;
-    }
-
-    private byte[] runTransformers(final String name, final String transformedName, byte[] basicClass) {
-        if (DEBUG_FINER) {
-            LOGGER.trace("Beginning transform of {{} ({})} Start Length: {}",
-                    name, transformedName, (basicClass == null ? 0 : basicClass.length));
-            for (final IClassTransformer transformer : transformers) {
-                final String transName = transformer.getClass().getName();
-                LOGGER.trace("Before Transformer {{} ({})} {}: {}", name,
-                        transformedName, transName, (basicClass == null ? 0 : basicClass.length));
-                basicClass = transformer.transform(name, transformedName, basicClass);
-                LOGGER.trace("After  Transformer {{} ({})} {}: {}", name,
-                        transformedName, transName, (basicClass == null ? 0 : basicClass.length));
-            }
-            LOGGER.trace("Ending transform of {{} ({})} Start Length: {}", name,
-                    transformedName, (basicClass == null ? 0 : basicClass.length));
+          }
         } else {
-            for (final IClassTransformer transformer : transformers) {
-                basicClass = transformer.transform(name, transformedName, basicClass);
-            }
+          Package pkg = getPackage(packageName);
+          if (pkg == null) {
+            pkg = definePackage(packageName, null, null, null, null, null, null, null);
+          } else if (pkg.isSealed()) {
+            URL url = urlConnection != null ? urlConnection.getURL() : null;
+            LOGGER.error("The URL {} is defining elements for sealed path {}", url, packageName);
+          }
         }
-        return basicClass;
+      }
+
+      // Define class
+      final CodeSource codeSource =
+          urlConnection == null ? null : new CodeSource(urlConnection.getURL(), signers);
+      final Class<?> cls =
+          defineClass(transformedName, transformedClass, 0, transformedClass.length, codeSource);
+      cachedClasses.put(transformedName, cls);
+      return cls;
+    } catch (Exception e) {
+      invalidClasses.add(name);
+      if (DEBUG) LOGGER.trace("Exception encountered attempting classloading of {}", name, e);
+      throw new ClassNotFoundException(name, e);
+    }
+  }
+
+  @SuppressWarnings("ResultOfMethodCallIgnored")
+  private void saveTransformedClass(final byte[] data, final String transformedName) {
+    if (tempFolder == null || data == null) {
+      return;
     }
 
-    /**
-     * Adds an URL for the class loader to check
-     *
-     * @param url The url to add
-     */
+    final File outFile =
+        new File(tempFolder, transformedName.replace('.', File.separatorChar) + ".class");
+    final File outDir = outFile.getParentFile();
 
-    @Override
-    public void addURL(final URL url) {
-        super.addURL(url);
-        sources.add(url);
+    if (!outDir.exists()) {
+      outDir.mkdirs();
     }
 
-    /**
-     * Gets the URL list
-     *
-     * @return A list of URLs that this class loader checks.
-     */
-
-    public List<URL> getSources() {
-        return sources;
+    if (outFile.exists()) {
+      outFile.delete();
     }
 
-    private byte[] readFully(InputStream stream) {
-        try {
-            byte[] buffer = getOrCreateBuffer();
+    try {
+      LOGGER.debug(
+          "Saving transformed class \"{}\" to \"{}\"",
+          transformedName,
+          outFile.getAbsolutePath().replace('\\', '/'));
 
-            int read;
-            int totalLength = 0;
-            while ((read = stream.read(buffer, totalLength, buffer.length - totalLength)) != -1) {
-                totalLength += read;
+      final OutputStream output = new FileOutputStream(outFile);
+      output.write(data);
+      output.close();
+    } catch (IOException ex) {
+      LOGGER.warn("Could not save transformed class \"{}\"", transformedName, ex);
+    }
+  }
 
-                // Extend our buffer
-                if (totalLength >= buffer.length - 1) {
-                    byte[] newBuffer = new byte[buffer.length + BUFFER_SIZE];
-                    System.arraycopy(buffer, 0, newBuffer, 0, buffer.length);
-                    buffer = newBuffer;
-                }
-            }
+  private String untransformName(final String name) {
+    return this.renameTransformer != null ? this.renameTransformer.unmapClassName(name) : name;
+  }
 
-            final byte[] result = new byte[totalLength];
-            System.arraycopy(buffer, 0, result, 0, totalLength);
-            return result;
-        } catch (Throwable t) {
-            LOGGER.warn("Problem loading class", t);
-            return new byte[0];
-        }
+  private String transformName(final String name) {
+    return this.renameTransformer != null ? this.renameTransformer.remapClassName(name) : name;
+  }
+
+  private boolean isSealed(final String path, final Manifest manifest) {
+    Attributes attributes = manifest.getAttributes(path);
+    String sealed = attributes != null ? attributes.getValue(Name.SEALED) : null;
+
+    if (sealed == null) {
+      sealed =
+          (attributes = manifest.getMainAttributes()) != null
+              ? attributes.getValue(Name.SEALED)
+              : null;
     }
 
-    private byte[] getOrCreateBuffer() {
-        byte[] buffer = loadBuffer.get();
-        if (buffer == null) {
-            loadBuffer.set(new byte[BUFFER_SIZE]);
-            buffer = loadBuffer.get();
-        }
-        return buffer;
+    return "true".equalsIgnoreCase(sealed);
+  }
+
+  private URLConnection findCodeSourceConnectionFor(final String name) {
+    final URL resource = findResource(name);
+    if (resource != null) {
+      try {
+        return resource.openConnection();
+      } catch (IOException exception) {
+        throw new RuntimeException(exception);
+      }
     }
 
-    /**
-     * Gets the transformers injected.
-     *
-     * @return An immutable list of transformers.
-     */
+    return null;
+  }
 
-    public List<IClassTransformer> getTransformers() {
-        return Collections.unmodifiableList(transformers);
+  private byte[] runTransformers(
+      final String name, final String transformedName, byte[] classData) {
+
+    if (DEBUG_FINER) {
+      LOGGER.trace(
+          "Beginning transform of {{} ({})} Start Length: {}",
+          name,
+          transformedName,
+          (classData == null ? 0 : classData.length));
     }
 
-    /**
-     * Adds the given prefix to the class loader exclusion list. Classes that have a prefix in this list will
-     * be loaded with the parent class loader
-     *
-     * @param toExclude The prefix to exclude
-     */
+    for (final IClassTransformer transformer : this.transformers) {
+      String transformerName = transformer.getClass().getName();
 
-    public void addClassLoaderExclusion(String toExclude) {
-        classLoaderExceptions.add(toExclude);
+      if (DEBUG_FINER) {
+        LOGGER.trace(
+            "Before Transformer {{} ({})} {}: {}",
+            name,
+            transformedName,
+            transformerName,
+            (classData == null ? 0 : classData.length));
+      }
+
+      classData = transformer.transform(name, transformedName, classData);
+
+      if (DEBUG_FINER) {
+        LOGGER.trace(
+            "After  Transformer {{} ({})} {}: {}",
+            name,
+            transformedName,
+            transformerName,
+            (classData == null ? 0 : classData.length));
+      }
     }
 
-    /**
-     * Adds the given prefix to the transformer exclusion list. Classes that have a prefix in this list will
-     * be loaded without transformers being run on them.
-     *
-     * @param toExclude The prefix to exclude.
-     */
+    return classData;
+  }
 
-    public void addTransformerExclusion(String toExclude) {
-        transformerExceptions.add(toExclude);
+  /**
+   * Adds an URL for the class loader to check
+   *
+   * @param url The url to add
+   */
+  @Override
+  public void addURL(final URL url) {
+    super.addURL(url);
+    this.sources.add(url);
+  }
+
+  /**
+   * Gets the URL list
+   *
+   * @return A list of URLs that this class loader checks.
+   */
+  public List<URL> getSources() {
+    return this.sources;
+  }
+
+  private byte[] readFully(InputStream stream) {
+
+    try (ByteArrayOutputStream byteArrayOutputStream =
+        new ByteArrayOutputStream(stream.available())) {
+      int readableBytes;
+      byte[] buffer = this.loadBuffer.get();
+
+      while ((readableBytes = stream.read(buffer, 0, buffer.length)) != -1) {
+        byteArrayOutputStream.write(buffer, 0, readableBytes);
+      }
+
+      return byteArrayOutputStream.toByteArray();
+    } catch (Throwable throwable) {
+      LOGGER.warn("Problem reading stream fully!", throwable);
+      return null;
     }
+  }
 
-    /**
-     * Gets the bytecode of a class.
-     *
-     * @param name The name of the class
-     * @return The untransformed bytecode of the class.
-     * @throws IOException If the class loader fails to open a connection to the URL.
-     */
+  /**
+   * Gets the transformers injected.
+   *
+   * @return An immutable list of transformers.
+   */
+  public List<IClassTransformer> getTransformers() {
+    return Collections.unmodifiableList(this.transformers);
+  }
 
-    public byte[] getClassBytes(String name) throws IOException {
-        if (negativeResourceCache.contains(name)) {
-            return null;
-        } else if (resourceCache.containsKey(name)) {
-            return resourceCache.get(name);
-        }
-        if (name.indexOf('.') == -1) {
-            for (final String reservedName : RESERVED_NAMES) {
-                if (name.toUpperCase(Locale.ENGLISH).startsWith(reservedName)) {
-                    final byte[] data = getClassBytes("_" + name);
-                    if (data != null) {
-                        resourceCache.put(name, data);
-                        return data;
-                    }
-                }
-            }
-        }
+  /**
+   * Adds the given prefix to the class loader exclusion list. Classes that have a prefix in this
+   * list will be loaded with the parent class loader
+   *
+   * @param toExclude The prefix to exclude
+   */
+  public void addClassLoaderExclusion(String toExclude) {
+    this.classLoaderExceptions.add(toExclude);
+  }
 
-        InputStream classStream = null;
-        try {
-            final String resourcePath = name.replace('.', '/').concat(".class");
-            final URL classResource = findResource(resourcePath);
+  /**
+   * Adds the given prefix to the transformer exclusion list. Classes that have a prefix in this
+   * list will be loaded without transformers being run on them.
+   *
+   * @param toExclude The prefix to exclude.
+   */
+  public void addTransformerExclusion(String toExclude) {
+    this.transformerExceptions.add(toExclude);
+  }
 
-            if (classResource == null) {
-                if (DEBUG) LOGGER.trace("Failed to find class resource {}", resourcePath);
-                negativeResourceCache.add(name);
-                return null;
-            }
-            classStream = classResource.openStream();
-
-            if (DEBUG) LOGGER.trace("Loading class {} from resource {}", name, classResource.toString());
-            final byte[] data = readFully(classStream);
-            resourceCache.put(name, data);
+  /**
+   * Gets the bytecode of a class.
+   *
+   * @param name The name of the class
+   * @return The untransformed bytecode of the class.
+   */
+  public byte[] getClassBytes(String name) {
+    if (this.negativeResourceCache.contains(name)) {
+      return null;
+    } else if (this.resourceCache.containsKey(name)) {
+      return this.resourceCache.get(name);
+    }
+    if (name.indexOf('.') == -1) {
+      for (final String reservedName : RESERVED_NAMES) {
+        if (name.toUpperCase(Locale.ENGLISH).startsWith(reservedName)) {
+          final byte[] data = getClassBytes("_" + name);
+          if (data != null) {
+            this.resourceCache.put(name, data);
             return data;
-        } finally {
-            closeSilently(classStream);
+          }
         }
+      }
     }
 
-    private static void closeSilently(Closeable closeable) {
-        if (closeable != null) {
-            try {
-                closeable.close();
-            } catch (IOException ignored) {
-            }
-        }
+    String resourcePath = name.replace('.', '/').concat(".class");
+    URL classResource = findResource(resourcePath);
+    if (classResource == null) {
+      if (DEBUG) {
+        LOGGER.trace("Failed to find class resource {}", resourcePath);
+      }
+      this.negativeResourceCache.add(name);
+      return null;
     }
-
-    /**
-     * Removes entries that were previously marked invalid.
-     *
-     * @param entriesToClear The entries to remove
-     */
-
-    public void clearNegativeEntries(Set<String> entriesToClear) {
-        negativeResourceCache.removeAll(entriesToClear);
+    try (InputStream classStream = classResource.openStream()) {
+      if (DEBUG) {
+        LOGGER.trace("Loading class {} from resource {}", name, classResource.toString());
+      }
+      byte[] data = Objects.requireNonNull(readFully(classStream));
+      this.resourceCache.put(name, data);
+      return data;
+    } catch (Exception exception) {
+      if (DEBUG) {
+        LOGGER.trace("Failed to load class {} from resource {}", name, classResource.toString());
+      }
+      this.negativeResourceCache.add(name);
+      return null;
     }
+  }
+
+  /**
+   * Removes entries that were previously marked invalid.
+   *
+   * @param entriesToClear The entries to remove
+   */
+  public void clearNegativeEntries(Set<String> entriesToClear) {
+    this.negativeResourceCache.removeAll(entriesToClear);
+  }
 }
