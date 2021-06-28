@@ -53,7 +53,8 @@ public class Launch {
 
   /** Creates a new instance of Launch. This is only used in the main method. */
   private Launch() {
-    if (getClass().getClassLoader() instanceof URLClassLoader urlClassLoader) {
+    if (getClass().getClassLoader() instanceof URLClassLoader) {
+      URLClassLoader urlClassLoader = (URLClassLoader) getClass().getClassLoader();
       Launch.classLoader = new LaunchClassLoader(urlClassLoader.getURLs());
     } else {
       Launch.classLoader = new LaunchClassLoader(urls());

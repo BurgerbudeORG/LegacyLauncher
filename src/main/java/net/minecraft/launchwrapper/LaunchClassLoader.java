@@ -80,7 +80,7 @@ public class LaunchClassLoader extends URLClassLoader {
    */
   @SuppressWarnings("ResultOfMethodCallIgnored")
   public LaunchClassLoader(URL[] sources) {
-    super(sources, null);
+    super(sources, getPlatformClassloader());
     this.sources = new ArrayList<>(Arrays.asList(sources));
 
     // classloader exclusions
@@ -96,24 +96,6 @@ public class LaunchClassLoader extends URLClassLoader {
     addTransformerExclusion("jdk.");
     addTransformerExclusion("javax.");
     addTransformerExclusion("org.objectweb.asm.");
-
-    ClassLoader systemClassLoader = ClassLoader.getSystemClassLoader();
-
-    // By default LaunchWrapper inherits the class path from the system class loader.
-    // However, JRE extensions (e.g Nashorn in the jre/lib/ext directory) are not part of the class
-    // path of the system class loader.
-    //
-    // Instead, they're loaded using a parent class loader. Currently, LaunchWrapper does not fall
-    // back to the parent class loader if it's unable to find a class on its class path. To make
-    // the JRE extensions usable for plugins we manually add the URL's from the ExtClassLoader to
-    // LaunchWrapper's class path.
-    if (systemClassLoader != null) {
-      systemClassLoader = systemClassLoader.getParent();
-
-      if (systemClassLoader instanceof URLClassLoader) {
-        Arrays.stream(((URLClassLoader) systemClassLoader).getURLs()).forEach(this::addURL);
-      }
-    }
 
     if (DEBUG_SAVE) {
       int x = 1;
@@ -134,6 +116,21 @@ public class LaunchClassLoader extends URLClassLoader {
         tempFolder.mkdirs();
       }
     }
+  }
+
+  private static ClassLoader getPlatformClassloader() {
+    String javaVersionProperty = System.getProperty("java.version");
+
+    if (!javaVersionProperty.startsWith("1.")) {
+      try {
+        return (ClassLoader) ClassLoader.class
+                .getDeclaredMethod("getPlatformClassLoader")
+                .invoke(null);
+      } catch (Throwable ignored) {
+        LOGGER.warn("No platform classloader found: {}", javaVersionProperty);
+      }
+    }
+    return null;
   }
 
   private static void closeSilently(Closeable closeable) {
@@ -262,7 +259,8 @@ public class LaunchClassLoader extends URLClassLoader {
       if (lastDot > -1
           && (!untransformedName.startsWith("net.minecraft.")
               && !untransformedName.startsWith("com.mojang."))) {
-        if (urlConnection instanceof final JarURLConnection jarURLConnection) {
+        if (urlConnection instanceof JarURLConnection) {
+          JarURLConnection jarURLConnection = (JarURLConnection) urlConnection;
           final JarFile jarFile = jarURLConnection.getJarFile();
 
           if (jarFile != null && jarFile.getManifest() != null) {
